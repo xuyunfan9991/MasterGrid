@@ -44,6 +44,8 @@
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
+`./gradlew assembleRelease` 编译发布版时，如果项目根目录有 `keystore.properties`（包含 `storeFile`、`storePassword`、`keyAlias`、`keyPassword` 四项），就用其中的密钥签名；没有这个文件时自动改用调试密钥。这个文件和密钥文件都不会提交到 git。
+
 ColorOS 用 `adb install` 时，手机上会弹一个确认框，要点「继续安装」，否则会报错 `-99`。装好后同样要按上面第 3 步开启无障碍服务。
 
 ## 使用

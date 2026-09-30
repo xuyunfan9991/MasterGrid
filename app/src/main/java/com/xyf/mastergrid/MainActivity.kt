@@ -22,6 +22,7 @@ import androidx.recyclerview.widget.RecyclerView
 class MainActivity : Activity() {
     private lateinit var store: FilterStore
     private lateinit var status: TextView
+    private lateinit var camera: TextView
     private lateinit var empty: TextView
     private val adapter = FilterAdapter()
     private val touchHelper = ItemTouchHelper(DragCallback())
@@ -31,6 +32,7 @@ class MainActivity : Activity() {
         setContentView(R.layout.activity_main)
         store = FilterStore(this)
         status = findViewById(R.id.status)
+        camera = findViewById(R.id.camera)
         empty = findViewById(R.id.empty)
 
         findViewById<Button>(R.id.btnA11y).setOnClickListener {
@@ -54,9 +56,24 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         val on = serviceEnabled()
-        status.text = if (on) "✅ 无障碍服务已开启" else "⚠️ 无障碍服务未开启：请在无障碍设置 → 已下载的应用 里打开「大师滤镜宫格」"
+        status.text = if (on) {
+            "✅ 无障碍服务已开启"
+        } else {
+            "⚠️ 无障碍服务未开启：请在无障碍设置 → 已下载的应用 里打开「大师滤镜宫格」。" +
+                "如果它经常自己关掉，请在 应用管理 → 大师滤镜宫格 里允许自启动、允许后台运行。"
+        }
+        camera.text = cameraStatus()
         adapter.load()
         empty.visibility = if (adapter.itemCount == 0) View.VISIBLE else View.GONE
+    }
+
+    private fun cameraStatus(): String {
+        val v = CameraDriver.cameraVersion(this) ?: return "⚠️ 没找到 OPPO 相机"
+        return when (v) {
+            in CameraDriver.TESTED_CAMERA_VERSIONS -> "✅ 相机 $v：已适配"
+            store.verifiedCameraVersion -> "✅ 相机 $v：已识别到大师模式"
+            else -> "⚠️ 相机 $v：没有测试过这个版本。如果大师模式里不出现悬浮按钮，可能是相机界面变了"
+        }
     }
 
     private fun serviceEnabled(): Boolean {
@@ -91,7 +108,7 @@ class MainActivity : Activity() {
         @SuppressLint("ClickableViewAccessibility")
         override fun onBindViewHolder(h: Holder, position: Int) {
             val name = items[position]
-            val (title, base) = FilterStore.split(name)
+            val (title, base) = FilterLists.split(name)
             h.name.text = title
             h.sub.text = base ?: ""
             h.sub.visibility = if (base == null) View.GONE else View.VISIBLE

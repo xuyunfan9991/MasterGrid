@@ -47,6 +47,10 @@ class Overlay(
     private var panel: View? = null
     private var panelHiddenAt = 0L
     private var bubble: TextView? = null
+    private val bubbleLp = baseParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT).apply {
+        gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+        y = dp(56)
+    }
     private val hideBubble = Runnable { removeBubble() }
 
     /** 最近一次在滤镜界面读到的滤镜名，用于在宫格里高亮。 */
@@ -69,6 +73,8 @@ class Overlay(
         wm.addView(b, buttonLp)
         button = b
     }
+
+    val buttonShown get() = button != null
 
     fun hideButton() {
         button?.let { wm.removeView(it) }
@@ -115,7 +121,7 @@ class Overlay(
 
         card.addView(text("我的滤镜", 18f, Color.WHITE, bold = true))
         currentName?.let {
-            card.addView(text("当前：${FilterStore.split(it).first}", 12f, 0xFF9AA0A6.toInt()))
+            card.addView(text("当前：${FilterLists.split(it).first}", 12f, 0xFF9AA0A6.toInt()))
         }
 
         val names = store.visibleCustom()
@@ -185,26 +191,31 @@ class Overlay(
         if (panel != null) hidePanel() else showPanel()
     }
 
-    /** 屏幕上方的小提示；sticky 时一直显示到下一条消息。 */
-    fun showMessage(msg: String, sticky: Boolean = false) {
+    /**
+     * 屏幕上方的小提示；sticky 时一直显示到下一条消息。
+     * 给了 onTap 时气泡可以点（用来停止正在进行的操作），否则不接收触摸，免得挡住模拟手势。
+     */
+    fun showMessage(msg: String, sticky: Boolean = false, onTap: (() -> Unit)? = null) {
         handler.removeCallbacks(hideBubble)
-        val existing = bubble
-        if (existing != null) {
-            existing.text = msg
-        } else {
-            val t = text(msg, 14f, Color.WHITE).apply {
-                setPadding(dp(16), dp(8), dp(16), dp(8))
-                background = rounded(0xE6202124.toInt(), dp(20))
-            }
-            val lp = baseParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT).apply {
-                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-                y = dp(56)
-                flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-            }
-            wm.addView(t, lp)
-            bubble = t
+        val t = bubble ?: text(msg, 14f, Color.WHITE).apply {
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            background = rounded(0xE6202124.toInt(), dp(20))
+            gravity = Gravity.CENTER
         }
-        if (!sticky) handler.postDelayed(hideBubble, 2500)
+        t.text = msg
+        t.setOnClickListener(onTap?.let { tap -> View.OnClickListener { tap() } })
+        bubbleLp.flags = if (onTap != null) {
+            bubbleLp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+        } else {
+            bubbleLp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        }
+        if (bubble == null) {
+            wm.addView(t, bubbleLp)
+            bubble = t
+        } else {
+            wm.updateViewLayout(t, bubbleLp)
+        }
+        if (!sticky) handler.postDelayed(hideBubble, if (msg.contains('\n')) 4000 else 2500)
     }
 
     private fun removeBubble() {
@@ -214,7 +225,7 @@ class Overlay(
     }
 
     private fun tile(name: String, selected: Boolean): View {
-        val (title, base) = FilterStore.split(name)
+        val (title, base) = FilterLists.split(name)
         val fg = if (selected) 0xFF1B1B3A.toInt() else Color.WHITE
         return LinearLayout(svc).apply {
             orientation = LinearLayout.VERTICAL

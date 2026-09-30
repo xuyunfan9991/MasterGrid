@@ -2,6 +2,8 @@ package com.xyf.mastergrid
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Path
 import android.graphics.PointF
 import android.graphics.Rect
@@ -9,8 +11,10 @@ import android.hardware.display.DisplayManager
 import android.util.Log
 import android.view.Display
 import android.view.accessibility.AccessibilityNodeInfo
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 import kotlin.math.abs
@@ -31,46 +35,61 @@ class CameraDriver(private val svc: AccessibilityService, private val store: Fil
         return if (desc?.contains("大师") == true) Screen.MASTER_MAIN else Screen.OTHER
     }
 
+    /** 相机在前台时，界面上能不能找到任何一个认识的控件；相机不在前台时返回 null。 */
+    fun recognizesCamera(): Boolean? {
+        val root = cameraRoot() ?: return null
+        return KNOWN_IDS.any { root.find(it) != null }
+    }
+
     fun currentName(): String? =
         cameraRoot()?.find(ID_FILTER_HINT)?.text?.toString()?.takeIf { it.isNotBlank() }
 
-    /** 切到目标滤镜；成功返回 null，失败返回给用户看的原因。 */
-    suspend fun goTo(target: String): String? {
-        if (!ensureFilterScreen()) return "没能打开滤镜界面"
+    /** 切换结果：error 为 null 表示成功；added/removed 是这次顺路发现的新导入 / 已删除的滤镜（只含自己导入的）。 */
+    class GoResult(val error: String?, val added: List<String> = emptyList(), val removed: List<String> = emptyList())
+
+    /** 切到目标滤镜。顺路发现保存的列表过时了，会自动校正。 */
+    suspend fun goTo(target: String): GoResult {
+        if (!ensureFilterScreen()) return GoResult("没能打开滤镜界面")
         val all = store.allFilters
         val ti = all.indexOf(target)
-        if (ti < 0) return "列表里没有「${FilterStore.split(target).first}」，请重新扫描"
+        if (ti < 0) return GoResult("列表里没有「${FilterLists.split(target).first}」，请重新扫描")
+        val learner = ListLearner(all)
 
         // 远距离先用圆点指示条快速拨过去；第二次机会留给方向校准后的重试
         repeat(2) {
             val ci = all.indexOf(currentName() ?: return@repeat)
-            if (ci >= 0 && abs(ti - ci) >= SCRUB_MIN_DISTANCE) scrubToward(all, ti)
+            if (ci >= 0 && abs(ti - ci) >= SCRUB_MIN_DISTANCE) scrubToward(all, ti, learner)
+        }
+        // 近距离或快速拨动没停准时，逐格滑动收尾
+        val error = Stepper.walk(all, target, stepCamera, learner)
+
+        val fixed = learner.result() ?: return GoResult(error)
+        val oldCustom = FilterLists.customPart(all)
+        val newCustom = store.applyScan(fixed)
+        val added = newCustom.filter { it !in oldCustom }
+        val removed = oldCustom.filter { it !in newCustom }
+        Log.i(TAG, "list fixed on the way: +$added -$removed")
+        return GoResult(error, added, removed)
+    }
+
+    /** 逐格滑动用到的相机操作，逻辑在 [Stepper]。 */
+    private val stepCamera = object : StepCamera {
+        private var rot = 0
+
+        override suspend fun name() = awaitName()
+
+        override suspend fun swipe(forward: Boolean): Boolean {
+            rot = rotation()
+            return this@CameraDriver.swipe(forward)
         }
 
-        // 近距离或快速拨动没停准时，逐格滑动收尾
-        var stuck = 0
-        repeat(MAX_STEPS) {
-            val cur = awaitName() ?: return "读不到当前滤镜"
-            if (cur == target) return null
-            val ci = all.indexOf(cur)
-            // 不认识的滤镜多半是新导入或系统滤镜，先往开头方向找
-            val forward = ci in 0 until ti
-            Log.d(TAG, "step cur=$cur ($ci) -> $target ($ti) forward=$forward")
-            val rot = rotation()
-            if (!swipe(forward)) return "滑动手势被系统拒绝"
-            val next = waitNameChange(cur)
-            if (next == null) {
-                // 没动：要么在列表一端而方向标反了，要么手势没生效
-                if (++stuck >= 3) return "滑不动了，可以试试重新扫描"
-                if (stuck == 1) store.flipSwipeSign(rot)
-                return@repeat
-            }
-            stuck = 0
-            val ni = all.indexOf(next)
-            Log.d(TAG, "moved to $next ($ni)")
-            if (ci >= 0 && ni >= 0 && (ni > ci) != forward) store.flipSwipeSign(rot)
+        override suspend fun awaitChange(old: String) =
+            waitNameChange(old).also { Log.d(TAG, "step $old -> $it") }
+
+        override fun flipSign() {
+            Log.d(TAG, "flip swipe sign (rotation $rot)")
+            store.flipSwipeSign(rot)
         }
-        return "步数过多，已停止"
     }
 
     /**
@@ -82,34 +101,37 @@ class CameraDriver(private val svc: AccessibilityService, private val store: Fil
         val start = currentName() ?: return Result.failure(IllegalStateException("读不到当前滤镜"))
         val rot = rotation()
 
-        var cur = start
-        var moved = 0
+        // 先用快速拨动翻到头（哪一头都行）；快速拨动用不了时逐格滑过去
         progress("正在滑到列表一端…")
-        while (moved < MAX_STEPS) {
-            cur = stepOrNull(forward = false, cur) ?: break
-            moved++
+        var cur = scrubToEnd() ?: run {
+            var c = start
+            var moved = 0
+            while (moved < Stepper.MAX_STEPS) {
+                c = stepOrNull(forward = false, c) ?: break
+                moved++
+            }
+            c
         }
 
+        // 从这一头逐个往另一头记录；往「向后」滑不动，说明停在了后面那头，就反着记
         val names = mutableListOf(cur)
-        while (names.size < MAX_STEPS) {
-            cur = stepOrNull(forward = true, cur) ?: break
-            if (cur != names.last()) names += cur
+        var forward = true
+        var next = stepOrNull(forward = true, cur)
+        if (next == null) {
+            forward = false
+            next = stepOrNull(forward = false, cur)
+        }
+        while (next != null && names.size < Stepper.MAX_STEPS) {
+            names += next
             progress("扫描中… 已记录 ${names.size} 个")
+            cur = next
+            next = stepOrNull(forward, cur)
         }
 
-        // 自己导入的滤镜在「标准」左边，且名字都是「基底 - 名称」
-        val std = names.indexOf(FilterStore.STANDARD)
-        val dashBefore = names.take(if (std >= 0) std else names.size / 2).count { FilterStore.SEPARATOR in it }
-        val dashAfter = names.drop(if (std >= 0) std + 1 else names.size / 2).count { FilterStore.SEPARATOR in it }
-        val ordered = if (dashAfter > dashBefore) {
-            store.flipSwipeSign(rot)
-            names.reversed()
-        } else {
-            names
-        }
-
+        val (ordered, flip) = FilterLists.orientScan(if (forward) names else names.reversed())
+        if (flip) store.flipSwipeSign(rot)
         val custom = store.applyScan(ordered)
-        Log.i(TAG, "scan: ${ordered.size} filters, ${custom.size} custom, reversed=${ordered !== names}")
+        Log.i(TAG, "scan: ${ordered.size} filters, ${custom.size} custom, flipped=$flip, recordedForward=$forward")
         progress("扫描完成，正在切回原滤镜…")
         goTo(start)
         return Result.success(custom)
@@ -151,20 +173,62 @@ class CameraDriver(private val svc: AccessibilityService, private val store: Fil
         return null
     }
 
-    /**
-     * 快速通道：按住滤镜名下面的圆点指示条（EffectStylePageIndicator）会展开；展开后把手指移到指示条外侧按住不动，
-     * 相机会自己连续翻（实测约 0.12 秒一格，比逐格滑动快 2~3 倍）。边按边读名字，到了目标就松手。
-     * 注意别在出界后再移动手指：每个 MOVE 事件都会重新计算目标，反而把自动翻页打断。
-     * 停在目标上返回 true；否则（多走了一格、方向反了等）交给逐格滑动收尾。
-     */
-    private suspend fun scrubToward(all: List<String>, ti: Int): Boolean {
-        val bar = cameraRoot()?.find(ID_INDICATOR)?.rect() ?: return false
+    /** 用快速拨动一路翻到头；快速拨动用不了时返回 null。 */
+    private suspend fun scrubToEnd(): String? {
+        if (scrub(dir = -1, timeoutMs = SCRUB_TO_END_TIMEOUT_MS) { false } < 0) return null
+        return currentName()
+    }
+
+    /** 用快速拨动翻到第 ti 个；停在目标上返回 true，否则（多走了一格、方向反了等）交给逐格滑动收尾。 */
+    private suspend fun scrubToward(all: List<String>, ti: Int, learner: ListLearner): Boolean {
         val startName = currentName() ?: return false
         val si = all.indexOf(startName)
         if (si < 0 || si == ti) return si == ti
         val rot = rotation()
-        val sign = store.scrubSign(rot) * (if (ti > si) 1 else -1)
+        learner.see(startName)
+        var changes = 0
+        var unknownRun = 0
+        var ci = si
+        scrub(dir = if (ti > si) 1 else -1, timeoutMs = SCRUB_TIMEOUT_MS) { name ->
+            learner.see(name)
+            changes++
+            val i = all.indexOf(name)
+            when {
+                i == ti -> true
+                // 不认识的滤镜多半是扫描后新导入的，接着翻；连着好几个都不认识，就交给逐格滑动
+                i < 0 -> ++unknownRun > MAX_UNKNOWN_RUN
+                else -> {
+                    unknownRun = 0
+                    ci = i
+                    when {
+                        (ti - i) * (ti - si) < 0 -> true // 已经越过目标
+                        changes >= 3 && abs(ti - i) > abs(ti - si) -> {
+                            store.flipScrubSign(rot) // 越翻越远：这个屏幕方向下出界方向标反了
+                            true
+                        }
+
+                        else -> false
+                    }
+                }
+            }
+        }
+        Log.d(TAG, "scrub $si -> $ti stopped near $ci after $changes steps")
+        return currentName() == all[ti]
+    }
+
+    /**
+     * 快速通道：按住滤镜名下面的圆点指示条（EffectStylePageIndicator）会展开；展开后把手指移到指示条外侧按住不动，
+     * 相机会自己连续翻（实测约 0.12 秒一格，比逐格滑动快 2~3 倍）。边按边读名字，onStep 返回 true 就松手；
+     * 翻到头（一段时间没变化）或超时也会松手。
+     * 注意别在出界后再移动手指：每个 MOVE 事件都会重新计算目标，反而把自动翻页打断。
+     * dir=+1 往列表后面翻，-1 往前翻。返回翻了几格；指示条按不出来时返回 -1。
+     */
+    private suspend fun scrub(dir: Int, timeoutMs: Long, onStep: (String) -> Boolean): Int {
+        val bar = cameraRoot()?.find(ID_INDICATOR)?.rect() ?: return -1
+        val startName = currentName() ?: return -1
+        val sign = store.scrubSign(rotation()) * dir
         val vertical = bar.height() > bar.width()
+        Log.d(TAG, "scrub dir=$dir indicator=$bar")
 
         // 沿指示条长轴、朝 sign 方向的端点再往外 margin
         fun end(r: Rect, dir: Int, margin: Float): PointF = when {
@@ -185,15 +249,20 @@ class CameraDriver(private val svc: AccessibilityService, private val store: Fil
         var wide: Rect? = null
         for (attempt in 1..PRESS_ATTEMPTS) {
             val pressedAt = System.currentTimeMillis()
-            val s0 = startStroke(press, HOLD_STROKE_MS) ?: return false
+            val s0 = startStroke(press, HOLD_STROKE_MS) ?: return -1
             // 展开动画一开始控件就会变宽，100ms 内没变宽说明这次按下被忽略了，立刻重按
             var r: Rect? = null
-            waitUntil(EXPAND_DETECT_MS, pollMs = 20) {
-                r = cameraRoot()?.find(ID_INDICATOR)?.rect()?.takeIf { it.longSide() > bar.longSide() }
-                r != null
+            try {
+                waitUntil(EXPAND_DETECT_MS, pollMs = 20) {
+                    r = cameraRoot()?.find(ID_INDICATOR)?.rect()?.takeIf { it.longSide() > bar.longSide() }
+                    r != null
+                }
+                if (r != null) delay(PRESS_MS - (System.currentTimeMillis() - pressedAt)) // 等展开动画结束才响应拖动
+            } catch (e: Throwable) {
+                withContext(NonCancellable) { endStroke(s0, press) }
+                throw e
             }
             if (r != null) {
-                delay(PRESS_MS - (System.currentTimeMillis() - pressedAt)) // 等展开动画结束才响应拖动
                 stroke = s0
                 wide = cameraRoot()?.find(ID_INDICATOR)?.rect() ?: r
                 break
@@ -202,43 +271,40 @@ class CameraDriver(private val svc: AccessibilityService, private val store: Fil
             endStroke(s0, press)
             delay(60)
         }
-        if (stroke == null || wide == null) return false
-        // 2) 展开后控件变宽（实测 368px → 512px），移到展开后的边界外才是快速档。
-        //    一步快速移过去，尽量不在中间的圆点上产生 MOVE（经过中间的点会直接跳过去）
-        val outside = end(wide, sign, dp(OUTSIDE_DP))
-        stroke = moveStroke(stroke, press, outside, 5) ?: return false
+        if (stroke == null || wide == null) return -1
 
-        val t0 = System.currentTimeMillis()
-        var lastChange = t0
-        var cur = startName
-        var ci = si
+        var held: GestureDescription.StrokeDescription = stroke
+        var at = press
         var changes = 0
-        var reached = false
-        while (true) {
-            val now = System.currentTimeMillis()
-            val idle = if (changes == 0) FIRST_STEP_TIMEOUT_MS else SCRUB_IDLE_MS
-            if (now - t0 > SCRUB_TIMEOUT_MS || now - lastChange > idle) break // 到头了或没在翻
-            delay(10)
-            val name = currentName() ?: break
-            if (name == cur) continue
-            cur = name
-            ci = all.indexOf(name)
-            changes++
-            lastChange = System.currentTimeMillis()
-            if (ci == ti) {
-                reached = true
-                break
+        val t0 = System.currentTimeMillis()
+        try {
+            // 2) 展开后控件变宽（实测 368px → 512px），移到展开后的边界外才是快速档。
+            //    一步快速移过去，尽量不在中间的圆点上产生 MOVE（经过中间的点会直接跳过去）
+            val outside = end(wide, sign, dp(OUTSIDE_DP))
+            held = moveStroke(held, press, outside, 5) ?: return changes
+            at = outside
+
+            var lastChange = t0
+            var cur = startName
+            while (true) {
+                val now = System.currentTimeMillis()
+                val idle = if (changes == 0) FIRST_STEP_TIMEOUT_MS else SCRUB_IDLE_MS
+                if (now - t0 > timeoutMs || now - lastChange > idle) break // 到头了或没在翻
+                delay(10)
+                val name = currentName() ?: break
+                if (name == cur) continue
+                cur = name
+                changes++
+                lastChange = System.currentTimeMillis()
+                if (onStep(name)) break
             }
-            if (ci < 0 || (ti - ci) * (ti - si) < 0) break // 不认识的滤镜或已经越过目标
-            if (changes >= 3 && abs(ti - ci) > abs(ti - si)) {
-                store.flipScrubSign(rot) // 越翻越远：这个屏幕方向下出界方向标反了
-                break
-            }
+        } finally {
+            // 被取消时也一定要松手，不然相机上会一直按着
+            withContext(NonCancellable) { endStroke(held, at) }
         }
-        endStroke(stroke, outside)
-        Log.d(TAG, "scrub $si -> $ti stopped at $ci after $changes steps in ${System.currentTimeMillis() - t0}ms")
+        Log.d(TAG, "scrub dir=$dir: $changes steps in ${System.currentTimeMillis() - t0}ms")
         delay(SCRUB_SETTLE_MS)
-        return reached && currentName() == all[ti]
+        return changes
     }
 
     private suspend fun startStroke(p: PointF, durationMs: Long): GestureDescription.StrokeDescription? {
@@ -354,8 +420,17 @@ class CameraDriver(private val svc: AccessibilityService, private val store: Fil
         private const val ID_FILTER_ENTER = "camera_menu_right_enter_button"
         private const val ID_PREVIEW = "preview_talkback"
         private const val ID_HEADLINE = "headline_view"
+        private val KNOWN_IDS = listOf(ID_FILTER_HINT, ID_FILTER_ENTER, ID_PREVIEW, ID_HEADLINE)
 
-        private const val MAX_STEPS = 120
+        /** 实测过的相机版本（versionName）。 */
+        val TESTED_CAMERA_VERSIONS = setOf("6.070.228")
+
+        fun cameraVersion(context: Context): String? = try {
+            context.packageManager.getPackageInfo(PKG, 0).versionName
+        } catch (_: PackageManager.NameNotFoundException) {
+            null
+        }
+
         private const val SWIPE_MS = 110L
         private const val CHANGE_TIMEOUT_MS = 700L
         private const val SETTLE_MS = 90L
@@ -367,6 +442,8 @@ class CameraDriver(private val svc: AccessibilityService, private val store: Fil
         private const val HOLD_STROKE_MS = 1000L
         private const val OUTSIDE_DP = 16f // 实测出界 8~25dp 都是约 0.12 秒一格
         private const val SCRUB_TIMEOUT_MS = 10_000L
+        private const val SCRUB_TO_END_TIMEOUT_MS = 30_000L
+        private const val MAX_UNKNOWN_RUN = 4
         private const val SCRUB_IDLE_MS = 1200L
         private const val FIRST_STEP_TIMEOUT_MS = 500L
         private const val PRESS_ATTEMPTS = 4

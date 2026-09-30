@@ -61,29 +61,29 @@ class FilterStore(context: Context) {
         sp.edit().putFloat("${key}_x", fx).putFloat("${key}_y", fy).apply()
     }
 
-    /**
-     * 按基底风格分组：风格之间按相机里系统滤镜（「标准」右边）的先后排，没对应上的风格按首次出现排在后面；
-     * 组内保持原来的相对顺序。
-     */
+    /** 按基底风格分组，规则见 [FilterLists.sortByStyle]。 */
     fun sortByStyle() {
-        val all = allFilters
-        val system = all.drop(all.indexOf(STANDARD) + 1)
-        val order = customOrder
-        val bases = order.map { split(it).second ?: it }.distinct()
-            .sortedBy { system.indexOf(it).let { i -> if (i < 0) Int.MAX_VALUE else i } }
-        customOrder = order.sortedBy { bases.indexOf(split(it).second ?: it) }
+        customOrder = FilterLists.sortByStyle(allFilters, customOrder)
     }
 
-    /** 保存一次扫描结果；保留用户原有的排序和隐藏，新滤镜追加到末尾。 */
+    /** 保存一次扫描（或切换时顺路校正）的结果；保留用户原有的排序和隐藏，新滤镜追加到末尾。返回自己导入的滤镜。 */
     fun applyScan(all: List<String>): List<String> {
-        val std = all.indexOf(STANDARD)
-        val custom = if (std >= 0) all.subList(0, std) else all.filter { SEPARATOR in it }
-        val old = customOrder
+        val custom = FilterLists.customPart(all)
         allFilters = all
-        customOrder = old.filter { it in custom } + custom.filter { it !in old }
+        customOrder = FilterLists.mergeOrder(customOrder, custom)
         hidden = hidden.filter { it in custom }.toSet()
         return custom
     }
+
+    /** 实际跑通过的相机版本（在上面识别出过大师模式），用来在设置页显示适配状态。 */
+    var verifiedCameraVersion: String?
+        get() = sp.getString(KEY_CAMERA_OK, null)
+        set(value) = sp.edit().putString(KEY_CAMERA_OK, value).apply()
+
+    /** 已经提示过「界面认不出」的相机版本，每个版本只提示一次。 */
+    var warnedCameraVersion: String?
+        get() = sp.getString(KEY_CAMERA_WARNED, null)
+        set(value) = sp.edit().putString(KEY_CAMERA_WARNED, value).apply()
 
     private fun readList(key: String): List<String> {
         val raw = sp.getString(key, null) ?: return emptyList()
@@ -95,20 +95,12 @@ class FilterStore(context: Context) {
         sp.edit().putString(key, JSONArray(value).toString()).apply()
     }
 
-    companion object {
-        const val STANDARD = "标准"
-        const val SEPARATOR = " - "
-
-        private const val KEY_ALL = "all_filters"
-        private const val KEY_ORDER = "custom_order"
-        private const val KEY_HIDDEN = "hidden"
-        private const val KEY_RETURN = "return_after_select"
-
-        /** 「和光 - 阴天 拍花」→ (「阴天 拍花」, 「和光」)；系统滤镜没有基底风格。 */
-        fun split(name: String): Pair<String, String?> {
-            val i = name.indexOf(SEPARATOR)
-            if (i < 0) return name to null
-            return name.substring(i + SEPARATOR.length) to name.substring(0, i)
-        }
+    private companion object {
+        const val KEY_ALL = "all_filters"
+        const val KEY_ORDER = "custom_order"
+        const val KEY_HIDDEN = "hidden"
+        const val KEY_RETURN = "return_after_select"
+        const val KEY_CAMERA_OK = "camera_verified"
+        const val KEY_CAMERA_WARNED = "camera_warned"
     }
 }

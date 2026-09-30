@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!-- 调试用：adb 下无法输入中文，借无障碍服务把文字填进当前输入框 -->
+        <provider
+            android:name=".DebugInputProvider"
+            android:authorities="com.xyf.mastergrid.debuginput"
+            android:exported="true" />
+    </application>
+</manifest>
